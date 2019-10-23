@@ -1,0 +1,10 @@
+.. code-block:: yaml
+
+    - name: Create a systemd unit file for ServiceX
+      hosts: localhost
+      become: true
+      roles:
+        - role: "systemd_service"
+          systemd_services:
+            - service_name: ServiceX
+              config_overrides: {}

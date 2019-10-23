@@ -1,0 +1,242 @@
+---
+
+- name: Pull systemd version
+  command: "systemctl --version"
+  changed_when: false
+  register: get_systemd_version
+  tags:
+    # Avoid ANSIBLE0006 lint issue: systemctl used in place of systemd module
+    - skip_ansible_lint
+    - always
+
+- name: Set systemd version
+  set_fact:
+    systemd_version: "{{ get_systemd_version.stdout_lines[0].split()[-1] }}"
+  tags:
+    - always
+
+- name: Ensure networkd is available
+  block:
+    - name: Check for networkd
+      command: "which networkctl"
+      failed_when: false
+      changed_when: false
+      register: networkd_installed
+
+    - name: Notify user
+      debug:
+        msg: >-
+          Local DHCP has been disabled because networkd was not installed or
+          is not part of the $PATH.
+      run_once: true
+      when:
+        - networkd_installed.rc != 0
+
+    - name: Disable local DHCP
+      set_fact:
+        systemd_PrivateNetworkLocalDHCP: false
+      when:
+        - networkd_installed.rc != 0
+  when:
+    - systemd_PrivateNetwork | bool
+    - systemd_PrivateNetworkLocalDHCP | bool
+  tags:
+    - systemd-service
+
+- name: Create TEMP run dir
+  file:
+    path: "/var/run/{{ item.service_name | replace(' ', '_') }}"
+    state: directory
+    owner: "{{ item.systemd_user_name | default(systemd_user_name) }}"
+    group: "{{ item.systemd_group_name | default(systemd_group_name) }}"
+    mode: "02755"
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Create TEMP service lock dir
+  file:
+    path: "/var/lock/{{ item.service_name | replace(' ', '_') }}"
+    state: directory
+    owner: "{{ item.systemd_user_name | default(systemd_user_name) }}"
+    group: "{{ item.systemd_group_name | default(systemd_group_name) }}"
+    mode: "02755"
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Create TEMP defined lock dir
+  file:
+    path: "{{ item.systemd_lock_path | default(systemd_lock_path) }}"
+    state: directory
+    owner: "{{ item.systemd_user_name | default(systemd_user_name) }}"
+    group: "{{ item.systemd_group_name | default(systemd_group_name) }}"
+    mode: "02755"
+  when:
+    - (item.systemd_lock_path is defined) or
+      (systemd_lock_path is defined)
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Create netns service entry
+  template:
+    src: "systemd-netns@.service.j2"
+    dest: "/etc/systemd/system/systemd-netns@.service"
+    mode: "0644"
+    owner: "root"
+    group: "root"
+  when:
+    - systemd_PrivateNetwork | bool
+  tags:
+    - systemd-service
+
+- name: Create netns-access service entry
+  template:
+    src: "systemd-netns-access@.service.j2"
+    dest: "/etc/systemd/system/systemd-netns-access@.service"
+    mode: "0644"
+    owner: "root"
+    group: "root"
+  when:
+    - systemd_PrivateNetwork | bool
+  tags:
+    - systemd-service
+
+- name: Create netns dhcp server
+  template:
+    src: "systemd-dhcp.network.j2"
+    dest: "/etc/systemd/network/systemd-mv-{{ systemd_PrivateNetworkInterface }}.network"
+    mode: "0644"
+    owner: "root"
+    group: "root"
+  when:
+    - systemd_PrivateNetwork | bool
+    - systemd_PrivateNetworkLocalDHCP | bool
+  notify:
+    - systemd networkd restart
+  tags:
+    - systemd-service
+
+- name: Create tmpfiles.d entry
+  template:
+    src: "systemd-tmpfiles.j2"
+    dest: "/etc/tmpfiles.d/{{ item.systemd_tempd_prefix | default(systemd_tempd_prefix) }}-{{ item.service_name | replace(' ', '_') }}.conf"
+    mode: "0644"
+    owner: "root"
+    group: "root"
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Check ExecStarts
+  fail:
+    msg: >-
+      When the service type is "simple" only ONE command can be started. Check
+      The list of execstarts and limit it to a single command per service or
+      consider using the "oneshot" service type. Defined ExecStart commands
+      "{{ item.execstarts }}".
+  when:
+    - item.execstarts is not string
+    - item.execstarts | length > 1
+    - item.service_type | default(systemd_default_service_type) != 'oneshot'
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Check ExecStops
+  fail:
+    msg: >-
+      When the service type is "simple" only ONE command can be stopped. Check
+      The list of execstops and limit it to a single command per service or
+      consider using the "oneshot" service type. Defined ExecStop commands
+      "{{ item.execstops }}".
+  when:
+    - item.execstops is not string
+    - item.execstops | default([]) | length > 1
+    - item.service_type | default(systemd_default_service_type) != 'oneshot'
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Check ExecReloads
+  fail:
+    msg: >-
+      When the service type is "simple" only ONE command can be reloaded. Check
+      The list of execreloads and limit it to a single command per service or
+      consider using the "oneshot" service type. Defined ExecStop commands
+      "{{ item.execreloads }}".
+  when:
+    - item.execreloads is not string
+    - item.execreloads | default([]) | length > 1
+    - item.service_type | default(systemd_default_service_type) != 'oneshot'
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Check timers
+  fail:
+    msg: >-
+      When using systemd timers the "state" must be defined under the timer key.
+  when:
+    - item.timer is defined
+    - item.timer.state is undefined
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Place the systemd service
+  template:
+    src: "systemd-service.j2"
+    dest: "/etc/systemd/system/{{ item.service_name | replace(' ', '_') }}.service"
+    mode: "0644"
+    owner: "root"
+    group: "root"
+  with_items: "{{ systemd_services }}"
+  notify:
+    - systemd service changed
+  register: systemd_services_result
+  tags:
+    - systemd-service
+
+- name: Place the systemd timer
+  template:
+    src: "systemd-timer.j2"
+    dest: "/etc/systemd/system/{{ item.service_name | replace(' ', '_') }}.timer"
+    mode: "0644"
+    owner: "root"
+    group: "root"
+  when:
+    - item.timer is defined
+  with_items: "{{ systemd_services }}"
+  notify:
+    - systemd service changed
+  register: systemd_timer_result
+  tags:
+    - systemd-service
+
+- name: Reload systemd on unit change
+  systemd:
+    daemon_reload: yes
+  when:
+    - (systemd_services_result is changed) or (systemd_timer_result is changed)
+
+- name: Load service
+  systemd:
+    name: "{{ item.service_name | replace(' ', '_') }}.service"
+    enabled: "{{ item.enabled | default(systemd_service_enabled) }}"
+    state: "{{ (item.timer is defined) | ternary(omit, (item.state | default(omit))) }}"
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
+
+- name: Load timer
+  systemd:
+    name: "{{ item.service_name | replace(' ', '_') }}.timer"
+    enabled: "{{ item.enabled | default(systemd_service_enabled) }}"
+    state: "{{ item.timer.state | default(omit) }}"
+  when:
+    - item.timer is defined
+  with_items: "{{ systemd_services }}"
+  tags:
+    - systemd-service
